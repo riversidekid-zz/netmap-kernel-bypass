@@ -44,6 +44,59 @@
 #endif /* NETMAP_LINUX_HAVE_SCHED_MM */
 
 #include "netmap_linux_config.h"
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/inetdevice.h>
+#include <net/net_namespace.h>
+#include <net/rtnetlink.h>
+#include <net/inet_common.h>
+#include <linux/skbuff.h>
+
+#ifdef KERNEL_BYPASS 
+void skb_dump(struct sk_buff *skb)
+{
+   struct sk_buff *frag_iter;
+   int i;
+
+   printk("skb len=%u data_len=%u pkt_type=%u gso_size=%u gso_type=%u nr_frags=%u ip_summed=%u csum=%x csum_complete_sw=%d csum_valid=%d csum_level=%u\n",
+          skb->len, skb->data_len, skb->pkt_type,
+          skb_shinfo(skb)->gso_size, skb_shinfo(skb)->gso_type,
+          skb_shinfo(skb)->nr_frags, skb->ip_summed, skb->csum,
+          skb->csum_complete_sw, skb->csum_valid, skb->csum_level);
+
+   printk("skb head %x data %x network_header %d mac_header %d\n", skb->head, skb->data, skb->network_header, skb->mac_header);
+   //print_hex_dump("--", "mac header: ", DUMP_PREFIX_OFFSET, 16, 1,
+   //           skb_mac_header(skb), skb_mac_header_len(skb),
+   //           false);
+
+   // print_hex_dump("--", "network header: ", DUMP_PREFIX_OFFSET,
+   //            16, 1, skb_network_header(skb),
+   //            skb_network_header_len(skb), false);
+
+   print_hex_dump("--", "skb data: ", DUMP_PREFIX_OFFSET, 16, 1,
+              skb->data, skb->len, false);
+
+   for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+       skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+       u32 p_off, p_len, copied;
+       struct page *p;
+       u8 *vaddr;
+
+       skb_frag_foreach_page(frag, frag->page_offset, skb_frag_size(frag),
+                     p, p_off, p_len, copied) {
+           vaddr = kmap_atomic(p);
+           print_hex_dump("--", "skb frag: ", DUMP_PREFIX_OFFSET,
+                      16, 1, vaddr + p_off, p_len, false);
+           kunmap_atomic(vaddr);
+       }
+   }
+
+   if (skb_has_frag_list(skb))
+       printk("----skb frags list:\n");
+   skb_walk_frags(skb, frag_iter)
+       skb_dump(frag_iter);
+}
+#endif
 
 void *
 nm_os_malloc(size_t size)
@@ -378,7 +431,7 @@ nm_os_csum_ipv4(struct nm_iphdr *iph)
 }
 
 /* Compute and insert a TCP/UDP checksum over IPv4: 'iph' points to the IPv4
- * header, 'data' points to the TCP/UDP header, 'datalen' is the length of
+ * header, 'data' points to the TCP/UDP header, 'datalen' is the lenght of
  * TCP/UDP header + payload.
  */
 void
@@ -391,7 +444,7 @@ nm_os_csum_tcpudp_ipv4(struct nm_iphdr *iph, void *data,
 }
 
 /* Compute and insert a TCP/UDP checksum over IPv6: 'ip6h' points to the IPv6
- * header, 'data' points to the TCP/UDP header, 'datalen' is the length of
+ * header, 'data' points to the TCP/UDP header, 'datalen' is the lenght of
  * TCP/UDP header + payload.
  */
 void
@@ -988,6 +1041,7 @@ nm_os_generic_xmit_frame(struct nm_os_gen_arg *a)
 
 	/* Copy a netmap buffer into the mbuf.
 	 * TODO Support the slot flags (NS_MOREFRAG, NS_INDIRECT). */
+        //printk(KERN_INFO "skb_copy a->addr %x len %d\n",a->addr, len);
 	skb_copy_to_linear_data(m, a->addr, len); // skb_store_bits(m, 0, addr, len);
 	skb_put(m, len);
 
@@ -1007,6 +1061,11 @@ nm_os_generic_xmit_frame(struct nm_os_gen_arg *a)
 	} else {
 		skb_reset_transport_header(m);
 	}
+
+        //printk(KERN_INFO "-------after copy_to_linear_data");
+        //skb_dump(m);
+
+
 
 	/* Hold a reference on this, we are going to recycle mbufs as
 	 * much as possible. */
@@ -1050,6 +1109,8 @@ nm_os_generic_xmit_frame(struct nm_os_gen_arg *a)
 		m->next = NULL;
 	}
 
+        //printk(KERN_INFO "------dev_queue_xmit----\n");
+        //skb_dump(m);
 	ret = dev_queue_xmit(m);
 
 	if (unlikely(ret != NET_XMIT_SUCCESS)) {
@@ -1330,8 +1391,8 @@ linux_netmap_mmap(struct file *f, struct vm_area_struct *vma)
 netdev_tx_t
 linux_netmap_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	netmap_transmit(dev, skb);
-	return (NETDEV_TX_OK);
+    netmap_transmit(dev, skb);
+    return (NETDEV_TX_OK);
 }
 
 #define native_change_mtu(na, dev, mtu)					\
@@ -1449,12 +1510,573 @@ linux_netmap_compat_ioctl(struct file *file, unsigned int cmd,
 }
 #endif
 
+/*************************************************************/
+/*===========================================================*/
+
+#ifdef KERNEL_BYPASS
+
+typedef struct brtc_priv_ {
+  struct net_device_stats stats;
+  struct ifnet *ifp;
+}brtc_priv_t;
+
+
+static int
+brtc_transmit_generic(struct ifnet *ifp, struct sk_buff *skb)
+{
+	struct netmap_adapter *na = NA(ifp);
+	struct netmap_kring  *tx_kring;
+	struct netmap_slot *slot;
+	u_int len = skb->len;
+	u_int error = ENOBUFS;
+	u_int head;
+	u_int offset;
+        skb_frag_t *frag;
+	u_int data_len;
+	char *dma;
+	u_int size;
+
+	// XXX [Linux] we do not need this lock
+	// if we follow the down/configure/up protocol -gl
+	// mtx_lock(&na->core_lock);
+        //skb_dump(skb);
+
+	//use ring 0 TODO
+	tx_kring = NMR(na, NR_TX)[0];
+
+	if (tx_kring->nr_mode == NKR_NETMAP_OFF) {
+	    printk(KERN_INFO "netmap off\n");
+	    error = ENXIO;
+	    goto done;
+	}
+
+	// XXX reconsider long packets if we handle fragments
+	if (len > NETMAP_BUF_SIZE(na)) { /* too long for us */
+		printk(KERN_INFO "pak too large\n");
+		nm_prerr("%s from_host, drop packet size %d > %d", na->name,
+			len, NETMAP_BUF_SIZE(na));
+		goto done;
+	}
+
+	/* protect against netmap_rxsync_from_host(), netmap_sw_to_nic()
+	 * and maybe other instances of netmap_transmit (the latter
+	 * not possible on Linux).
+	 * We enqueue the mbuf only if we are sure there is going to be
+	 * enough room in the host RX ring, otherwise we drop it.
+	 */
+	if (nm_kr_txempty(tx_kring)) {
+	   printk(KERN_INFO "tx empty\n");
+           error = ENXIO;
+	   goto done;   
+	}
+
+	//copy to netmap tx buffer
+	head = tx_kring->rhead;
+	slot = &tx_kring->ring->slot[head];
+	char *fp = NMB(tx_kring->na, slot); 
+
+	//printk(KERN_INFO "start copying packet...slot %x head %d hwcur %d fp %x len %d\n", 
+        //      slot, head, tx_kring->nr_hwcur, fp, skb->len);
+	//skb_dump(skb);
+	data_len = skb->len;
+	offset = 0;
+	dma = skb->data;
+	size = skb_headlen(skb);
+	for (frag = &skb_shinfo(skb)->frags[0];;frag++) {
+	  if (likely(!data_len)) {
+            break;
+	  } 
+	  //printk(KERN_INFO "skb - data_len %d size %d\n",data_len, size);
+          memcpy(fp + offset, dma, size);  
+	  data_len -= size;
+	  offset += size;
+	  dma = skb_frag_address(frag);
+	  size = skb_frag_size(frag);
+        }
+        slot->len = skb->len;
+
+	if ((head + 1) == tx_kring->nkr_num_slots) {
+          head = 0;
+        } else {
+	  head = head + 1;
+	}
+
+	tx_kring->rhead = tx_kring->rcur = head;
+
+	nm_prdis(2, "%s %d bufs in queue", na->name, mbq_len(q));
+
+	/* notify outside the lock */
+	error = 0;
+
+done:
+	if (skb)
+	   dev_kfree_skb_any(skb);
+	/* unconditionally wake up listeners */
+	tx_kring->nm_sync(tx_kring, 0);
+	/* this is normally netmap_notify(), but for nics
+	 * connected to a bridge it is netmap_bwrap_intr_notify(),
+	 * that possibly forwards the frames through the switch
+	 */
+
+	return (error);
+}
+
+
+
+/* The higher levels take care of making this non-reentrant (it's
+ * called with bh's disabled).
+ */
+static netdev_tx_t brtc_xmit(struct sk_buff *skb,
+				 struct net_device *dev)
+{
+    brtc_priv_t *priv = (brtc_priv_t *)(netdev_priv(dev));
+    struct netmap_adapter *na;
+    if(priv->ifp != NULL) {
+       na = NA(priv->ifp);
+       //printk(KERN_INFO "brtc_xmit----netmap:%s\n",na->name);
+       //update stats
+       priv->stats.tx_packets++;
+       priv->stats.tx_bytes += skb->data_len;
+       //send to netmap ring
+       brtc_transmit_generic(priv->ifp, skb);
+       //do tx sync
+       return NETDEV_TX_OK;
+    }
+    return NETDEV_TX_OK;
+}
+
+void brtc_lstats_read(struct net_device *dev, u64 *packets, u64 *bytes)
+{
+	*packets = 0;
+	*bytes = 0;
+}
+EXPORT_SYMBOL(brtc_lstats_read);
+
+static struct net_device_stats *brtc_get_stats(struct net_device *dev)
+{
+    brtc_priv_t *priv = netdev_priv(dev);
+
+    return &priv->stats;
+}
+
+static u32 always_on(struct net_device *dev)
+{
+	return 1;
+}
+
+static const struct ethtool_ops brtc_ethtool_ops = {
+	.get_link		= always_on,
+	.get_ts_info		= ethtool_op_get_ts_info,
+};
+
+static int brtc_dev_init(struct net_device *dev)
+{
+  printk(KERN_INFO "brtc_dev_init\n");
+  return 0;
+}
+
+static void brtc_dev_free(struct net_device *dev)
+{
+  //brtc_dev = NULL;
+  printk(KERN_INFO "brtc_dev_free\n");
+}
+
+static int brtc_get_port_name(struct net_device *dev, char *buf, size_t len)
+{
+   int ret;
+
+   ret = snprintf(buf, len, "BRTC");
+
+   if (ret >= len)
+	   return -EOPNOTSUPP;
+
+   return 0;
+}
+
+static const struct net_device_ops brtc_ops = {
+	.ndo_init        = brtc_dev_init,
+	.ndo_start_xmit  = brtc_xmit,
+	.ndo_get_stats = brtc_get_stats,
+	.ndo_set_mac_address = eth_mac_addr,
+	.ndo_get_phys_port_name = brtc_get_port_name,
+};
+
+static void gen_brtc_setup(struct net_device *dev,
+			 unsigned int mtu,
+			 const struct ethtool_ops *eth_ops,
+			 const struct net_device_ops *dev_ops,
+			 void (*dev_destructor)(struct net_device *dev))
+{
+    brtc_priv_t *priv = (brtc_priv_t*)netdev_priv(dev);
+    priv->ifp = NULL;
+    ether_setup(dev);
+    dev->ethtool_ops	= eth_ops;
+    dev->netdev_ops	= dev_ops;
+}
+
+/* The brtc device is special. There is only one instance
+ * per network namespace.
+ */
+static void brtc_setup(struct net_device *dev)
+{
+	gen_brtc_setup(dev, 1500, &brtc_ethtool_ops,
+		     &brtc_ops, brtc_dev_free);
+}
+
+static int brtc_net_init(struct netmap_adapter *na)
+{
+   static int index = 0;
+   struct net_device *dev;
+   int err;
+   char intf_name[8];
+
+   err = -ENOMEM;
+   na->brtc_dev = NULL;
+   snprintf(intf_name, 8, "brtc%d", index);
+   dev = alloc_netdev(sizeof(brtc_priv_t), intf_name, NET_NAME_UNKNOWN, brtc_setup);
+
+   if(!dev)
+	   goto out;
+   //dev_net_set(dev, get_net_ns_by_pid(task_pid_vnr(current)));
+   dev_net_set(dev, &init_net);
+
+   //dev->flags |= IFF_UP;
+
+   err = register_netdev(dev);
+
+   if(err)
+	   goto out_free_netdev;
+
+   //BUG_ON(dev->ifindex != LOOPBACK_IFINDEX);
+
+   na->brtc_dev = dev;
+
+   return 0;
+
+out_free_netdev:
+   free_netdev(dev);
+out:
+   //if(net_eq(net, &init_net))
+//	   panic("brtc: Failed to register netdevice: %d\n", err);
+   return err;
+}
+char *
+inet_ntoa(struct in_addr in)
+{
+   static char buffer[18];
+   unsigned char *bytes = (unsigned char *) &in;
+
+   snprintf(buffer, 18, "%d.%d.%d.%d", bytes[0], bytes[1], bytes[2], bytes[3]);
+   return buffer;
+}
+
+extern 
+void brtc_bind(struct netmap_adapter *na)
+{
+   struct net_device *brtc_dev = NULL;
+   struct sockaddr sa;
+   size_t size = sizeof(sa.sa_data);
+   struct ifnet *ifp = na->ifp;
+   struct net_device *phy_dev = NULL;
+   brtc_priv_t *b_priv = NULL;
+   struct in_device *in_dev = NULL;
+   struct in_ifaddr *ifa = NULL;
+   struct in_ifaddr bifa;
+   struct in_ifaddr __rcu **ifap = NULL;
+   struct ifreq ir;
+   struct sockaddr_in *bsin = (void *)&ir.ifr_addr;
+   struct socket *sock = NULL;
+   struct net *net_ns = NULL;
+   mm_segment_t old_fs; 
+   int err;
+
+   printk(KERN_INFO "brtc_bind\n");
+
+   err = brtc_net_init(na);
+   if (err) { 
+     printk(KERN_INFO "brtc interface create failed - rc %d\n", err);
+     return;
+   }
+   brtc_dev = (struct net_device*)(na->brtc_dev);
+
+   if (!brtc_dev) {
+     return;
+   }
+   b_priv = (brtc_priv_t *)(netdev_priv(brtc_dev));
+   b_priv->ifp = ifp;
+
+   //set IP,MAC
+   //get device netmap bind to
+   printk(KERN_INFO "====get device for %s\n",na->name);
+   //net_ns = get_net_ns_by_pid(task_pid_vnr(current));
+
+   phy_dev = ifunit_ref(na->name);
+   if (phy_dev != NULL) {
+      printk(KERN_INFO "====phy_dev %s\n",phy_dev->name);
+   } else   {
+      printk(KERN_INFO "====phy_dev NULL\n");
+      return;
+   }
+
+   //copy to brtc interface
+   sa.sa_family = phy_dev->type;
+   if (!phy_dev->addr_len) {
+      memset(sa.sa_data, 0, size);
+   } else {
+      memcpy(sa.sa_data, phy_dev->dev_addr, min_t(size_t, size, phy_dev->addr_len));
+   }
+   if_rele(phy_dev);
+
+   rtnl_lock();
+   dev_set_mac_address(brtc_dev, &sa);
+
+   netif_carrier_on(brtc_dev);
+
+   dev_change_flags(brtc_dev, brtc_dev->flags | IFF_UP);
+   rtnl_unlock();
+
+   //get ip address, netmask from phy_dev, and apply to brtc_dev
+   rtnl_lock();
+   in_dev = __in_dev_get_rtnl(phy_dev);
+   if (in_dev) {
+     for (ifap = &in_dev->ifa_list;
+          (ifa = rtnl_dereference(*ifap)) != NULL;
+          ifap = &ifa->ifa_next) {
+        if (!strcmp(phy_dev->name, ifa->ifa_label) )
+            break;
+     }
+   }
+   if (ifa) {
+      //dump address infor
+      printk(KERN_INFO "%s - ip %x mask %x broadcast %x dest %x\n",
+            phy_dev->name,
+            (uint32_t)ifa->ifa_local, 
+            (uint32_t)ifa->ifa_mask, 
+            (uint32_t)ifa->ifa_broadcast, 
+            (uint32_t)ifa->ifa_address);
+   } else {
+      rtnl_unlock();
+      return;
+   }
+   rtnl_unlock();
+   bifa.ifa_local = ifa->ifa_local;
+   bifa.ifa_mask  = ifa->ifa_mask;
+   bifa.ifa_broadcast = ifa->ifa_broadcast;
+   bifa.ifa_address = ifa->ifa_address;
+
+   //apply to brtc0
+   err = sock_create_kern(&init_net, AF_INET, SOCK_DGRAM, 0, &sock);
+   printk(KERN_INFO "sock create %d\n", err);
+
+   //first remove ip from phy
+   strcpy(ir.ifr_name, phy_dev->name);
+   ir.ifr_addr.sa_family = AF_INET;
+   memset(bsin, 0, sizeof(struct sockaddr_in));
+   bsin->sin_addr.s_addr = 0;
+   bsin->sin_family = AF_INET;   
+
+   old_fs = get_fs();
+   set_fs(KERNEL_DS);
+   err = inet_ioctl(sock, SIOCSIFADDR, (void __user*)&ir);
+   set_fs(old_fs);
+   printk(KERN_INFO "remove addr %s ret %d\n", phy_dev->name, err);
+
+   //apply saved config to brtc
+   strcpy(ir.ifr_name, brtc_dev->name);
+   ir.ifr_addr.sa_family = AF_INET; 
+
+   old_fs = get_fs();
+   set_fs(KERNEL_DS);
+   bsin->sin_addr.s_addr = bifa.ifa_address;
+   bsin->sin_family = AF_INET;
+ 
+   err = inet_ioctl(sock, SIOCSIFADDR, (void __user*)&ir);
+   printk(KERN_INFO "inet_ioctl addr ret %d\n", err);
+
+   bsin->sin_addr.s_addr = 0;
+
+   err = inet_ioctl(sock, SIOCGIFADDR, (void __user*)&ir);
+   printk(KERN_INFO "inet_ioctl gadd %s ret %d %s\n", brtc_dev->name,
+          err, 
+          inet_ntoa(bsin->sin_addr));
+   
+   bsin->sin_addr.s_addr = bifa.ifa_mask;
+   bsin->sin_family = AF_INET;
+   inet_ioctl(sock, SIOCSIFNETMASK, (void __user*)&ir);
+   printk(KERN_INFO "inet_ioctl NETMASK ret %d\n", err);
+   
+   bsin->sin_addr.s_addr = 0;
+   inet_ioctl(sock, SIOCGIFNETMASK, (void __user*)&ir);
+   printk(KERN_INFO "inet_ioctl gNETMASK ret %d %s\n", 
+          err, 
+          inet_ntoa(bsin->sin_addr));
+
+   bsin->sin_addr.s_addr = bifa.ifa_broadcast;
+   bsin->sin_family = AF_INET;
+   inet_ioctl(sock, SIOCSIFBRDADDR, (void __user*)&ir);
+   printk(KERN_INFO "inet_ioctl BAddr ret %d\n", err);
+
+   bsin->sin_addr.s_addr = 0;
+   inet_ioctl(sock, SIOCGIFBRDADDR, (void __user*)&ir);
+   printk(KERN_INFO "inet_ioctl gBaddr ret %d %s\n", 
+          err, 
+          inet_ntoa(bsin->sin_addr));
+
+   sock_release(sock);
+   set_fs(old_fs);
+}
+
+void brtc_unbind(struct netmap_adapter *na)
+{
+   struct net_device *brtc_dev = (struct net_device*)(na->brtc_dev);
+   struct in_device *in_dev = NULL;
+   struct in_ifaddr *ifa = NULL;
+   struct in_ifaddr __rcu **ifap = NULL;
+   struct in_ifaddr bifa;
+   struct ifreq ir;
+   struct sockaddr_in *bsin = (void *)&ir.ifr_addr;
+   struct socket *sock = NULL;
+   mm_segment_t old_fs;
+   int err;
+
+   printk(KERN_INFO "brtc_unbind\n");
+   if(brtc_dev) {
+     brtc_priv_t *b_priv = (brtc_priv_t *)(netdev_priv(brtc_dev));
+     na->brtc_dev = NULL;
+     b_priv->ifp = NULL;
+
+
+     //debug, dump ip address
+     rtnl_lock();
+     in_dev = __in_dev_get_rtnl(brtc_dev);
+     if (in_dev) {
+       for (ifap = &in_dev->ifa_list;
+            (ifa = rtnl_dereference(*ifap)) != NULL;
+            ifap = &ifa->ifa_next) {
+          if (!strcmp(brtc_dev->name, ifa->ifa_label) )
+              break;
+       }
+     }
+     rtnl_unlock();
+
+     bifa.ifa_local = ifa->ifa_local;
+     bifa.ifa_mask  = ifa->ifa_mask;
+     bifa.ifa_broadcast = ifa->ifa_broadcast;
+     bifa.ifa_address = ifa->ifa_address;
+
+     //remove brtc interface
+     printk(KERN_INFO "remove brtc interface\n");
+     unregister_netdev(brtc_dev);
+     //TO-FIX free will cause crash, probably napi 
+     //free_netdev(brtc_dev);
+ 
+     if (ifa) {
+        //dump address infor
+        printk(KERN_INFO "%s - ip %x mask %x broadcast %x dest %x\n",
+              brtc_dev->name,
+              ifa->ifa_local, 
+              ifa->ifa_mask, 
+              ifa->ifa_broadcast, 
+              ifa->ifa_address);
+
+        //apply back to phy interface
+        err = sock_create_kern(&init_net, AF_INET, SOCK_DGRAM, 0, &sock);
+        printk(KERN_INFO "sock create %d\n", err);
+
+
+        strcpy(ir.ifr_name, na->name);
+        ir.ifr_addr.sa_family = AF_INET; 
+
+        old_fs = get_fs();
+        set_fs(KERNEL_DS);
+        bsin->sin_addr.s_addr = bifa.ifa_address;
+        bsin->sin_family = AF_INET;
+ 
+        err = inet_ioctl(sock, SIOCSIFADDR, (void __user*)&ir);
+        printk(KERN_INFO "inet_ioctl addr ret %d\n", err);
+
+        bsin->sin_addr.s_addr = 0;
+
+        err = inet_ioctl(sock, SIOCGIFADDR, (void __user*)&ir);
+        printk(KERN_INFO "inet_ioctl gadd %s ret %d %s\n", brtc_dev->name,
+               err, 
+               inet_ntoa(bsin->sin_addr));
+        
+        bsin->sin_addr.s_addr = bifa.ifa_mask;
+        bsin->sin_family = AF_INET;
+        inet_ioctl(sock, SIOCSIFNETMASK, (void __user*)&ir);
+        printk(KERN_INFO "inet_ioctl NETMASK ret %d\n", err);
+        
+        bsin->sin_addr.s_addr = 0;
+        inet_ioctl(sock, SIOCGIFNETMASK, (void __user*)&ir);
+        printk(KERN_INFO "inet_ioctl gNETMASK ret %d %s\n", 
+               err, 
+               inet_ntoa(bsin->sin_addr));
+
+        bsin->sin_addr.s_addr = bifa.ifa_broadcast;
+        bsin->sin_family = AF_INET;
+        inet_ioctl(sock, SIOCSIFBRDADDR, (void __user*)&ir);
+        printk(KERN_INFO "inet_ioctl BAddr ret %d\n", err);
+
+        bsin->sin_addr.s_addr = 0;
+        inet_ioctl(sock, SIOCGIFBRDADDR, (void __user*)&ir);
+        printk(KERN_INFO "inet_ioctl gBaddr ret %d %s\n", 
+               err, 
+               inet_ntoa(bsin->sin_addr));
+
+        sock_release(sock);
+        set_fs(old_fs);
+     } else {
+       printk(KERN_INFO "failed to get ip at unbind\n");
+     }
+  }
+}
+
+void netmap_exception_path(struct ifnet *ifp, struct sk_buff *pkt)
+{
+  struct netmap_adapter *na = NA(ifp);
+  //struct sk_buff *skb = NULL;
+  brtc_priv_t *priv = netdev_priv(na->brtc_dev);
+
+  /*
+  skb = dev_alloc_skb(pkt->len);
+  if (!skb) {
+     printk(KERN_INFO "netmap_exception_path: low on mem\n");
+     goto out;
+  }
+
+  memcpy(skb_put(skb, pkt->len), pkt->data, pkt->len);
+
+  printk(KERN_INFO "netmap_exception_path<<<<<<<<\n");
+  skb_dump(pkt);
+
+  */
+
+  //write metadata 
+  pkt->dev = na->brtc_dev;
+  pkt->protocol = eth_type_trans(pkt, pkt->dev);
+  pkt->ip_summed = CHECKSUM_UNNECESSARY;
+  //update stats
+  priv->stats.rx_packets++;
+  priv->stats.rx_bytes += pkt->len;
+  //forward to network stack
+  netif_rx(pkt);
+
+out:
+  return;
+}
+
+#endif
+/************************************************************************************/
+
+
 static int
 linux_netmap_release(struct inode *inode, struct file *file)
 {
 	(void)inode;	/* UNUSED */
 	if (file->private_data)
 		netmap_dtor(file->private_data);
+
 	return (0);
 }
 
@@ -1474,6 +2096,7 @@ linux_netmap_open(struct inode *inode, struct file *file)
 	}
 	priv->np_filp = file;
 	file->private_data = priv;
+
 out:
 	NMG_UNLOCK();
 

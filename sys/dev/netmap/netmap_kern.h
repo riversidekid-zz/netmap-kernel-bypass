@@ -918,6 +918,9 @@ struct netmap_adapter {
 	 * bwrap, LINUX/v1000 and ptnetmap
 	 */
 	void *na_private;
+#ifdef KERNEL_BYPASS 
+	void *brtc_dev;  /*bytedance brtc interface */
+#endif
 
 	/* array of pipes that have this adapter as a parent */
 	struct netmap_pipe_adapter **na_pipes;

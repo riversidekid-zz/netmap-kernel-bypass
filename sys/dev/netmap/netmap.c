@@ -480,6 +480,11 @@ ports attached to the switch)
 #include <dev/netmap/netmap_kern.h>
 #include <dev/netmap/netmap_mem2.h>
 
+#ifdef KERNEL_BYPASS
+extern void brtc_bind(struct netmap_adapter *na);
+extern void brtc_unbind(struct netmap_adapter *na);
+#endif
+
 
 /* user-controlled variables */
 int netmap_verbose;
@@ -1101,6 +1106,9 @@ netmap_do_unregif(struct netmap_priv_d *priv)
 	/* mark the priv as unregistered */
 	priv->np_na = NULL;
 	priv->np_nifp = NULL;
+#ifdef KERNEL_BYPASS
+	brtc_unbind(na);
+#endif
 }
 
 struct netmap_priv_d*
@@ -2672,6 +2680,9 @@ netmap_do_regif(struct netmap_priv_d *priv, struct netmap_adapter *na,
 	 */
 	mb(); /* make sure previous writes are visible to all CPUs */
 	priv->np_nifp = nifp;
+#ifdef KERNEL_BYPASS
+        brtc_bind(na);
+#endif
 
 	return 0;
 
@@ -3184,6 +3195,10 @@ netmap_ioctl(struct netmap_priv_d *priv, u_long cmd, caddr_t data,
 		qfirst = priv->np_qfirst[t];
 		qlast = priv->np_qlast[t];
 		sync_flags = priv->np_sync_flags;
+#ifdef KERNEL_BYPASS
+                //skip q 0, reserved for brtc
+                if (qfirst  == 0) qfirst ++;
+#endif
 
 		for (i = qfirst; i < qlast; i++) {
 			struct netmap_kring *kring = krings[i];
@@ -3776,6 +3791,11 @@ netmap_poll(struct netmap_priv_d *priv, int events, NM_SELRECORD_T *sr)
 flush_tx:
 		for (i = priv->np_qfirst[NR_TX]; i < priv->np_qlast[NR_TX]; i++) {
 			int found = 0;
+#ifdef KERNEL_BYPASS
+                        // 0 is reserved for brtc
+                        if (i == 0) 
+                          continue;
+#endif
 
 			kring = na->tx_rings[i];
 			ring = kring->ring;

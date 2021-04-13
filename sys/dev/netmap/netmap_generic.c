@@ -846,7 +846,14 @@ generic_rx_handler(struct ifnet *ifp, struct mbuf *m)
 	} else if (unlikely(mbq_len(&kring->rx_queue) > 1024)) {
 		m_freem(m);
 	} else {
-		mbq_safe_enqueue(&kring->rx_queue, m);
+#ifdef KERNEL_BYPASS 
+		//check if is udp and send to brtc_dev
+                netmap_exception_path(ifp, m);
+		//mbq_safe_enqueue(&kring->rx_queue, m);
+		return 1;
+#else 
+               mbq_safe_enqueue(&kring->rx_queue, m);
+#endif
 	}
 
 	if (netmap_generic_mit < 32768) {
