@@ -804,7 +804,9 @@ generic_netmap_txsync(struct netmap_kring *kring, int flags)
 
 	return 0;
 }
-
+#ifdef KERNEL_BYPASS
+extern void netmap_exception_path(struct ifnet *ifp, struct mbuf *m);
+#endif
 
 /*
  * This handler is registered (through nm_os_catch_rx())
